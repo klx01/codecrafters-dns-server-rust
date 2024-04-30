@@ -24,3 +24,6 @@ bytes = "^1"            # helps manage buffers
 thiserror = "^1"       # error handling
 nom = "^7"              # parsing
 rand = "^0.8"             # randomness
+
+[profile.release]
+strip = "none"
