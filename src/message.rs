@@ -1,6 +1,9 @@
-use std::error::Error;
 use std::fmt::{Display, Formatter};
-use anyhow::Context;
+use std::io::Write;
+use nom::Err::Error;
+use nom::error::{ErrorKind, make_error};
+use nom::number::complete::{be_u16, be_u8};
+use nom::sequence::Tuple;
 
 #[derive(Debug)]
 pub(crate) struct DnsHeader {
@@ -17,40 +20,15 @@ pub(crate) struct DnsHeader {
     /// Number of records in the Additional section.
     pub additional_count: u16,
 }
-#[derive(Default)]
-#[repr(C)]
-pub(crate) struct DnsHeaderRaw {
-    id: [u8; 2],
-    bits: [u8; 2],
-    question_count: [u8; 2],
-    answer_count: [u8; 2],
-    authority_count: [u8; 2],
-    additional_count: [u8; 2],
-}
 impl DnsHeader {
-    pub(crate) fn get_raw(&self) -> DnsHeaderRaw {
-        DnsHeaderRaw {
-            id: self.id.to_be_bytes(),
-            bits: [self.bits1.into(), self.bits2.into()],
-            question_count: self.question_count.to_be_bytes(),
-            answer_count: self.answer_count.to_be_bytes(),
-            authority_count: self.authority_count.to_be_bytes(),
-            additional_count: self.additional_count.to_be_bytes(),
-        }
-    }
-}
-impl DnsHeaderRaw {
-    pub fn parse(&self) -> anyhow::Result<DnsHeader> {
-        let res = DnsHeader {
-            id: u16::from_be_bytes(self.id),
-            bits1: DnsHeaderBits1::try_from(self.bits[0]).context("failed to parse bits1")?,
-            bits2: DnsHeaderBits2::try_from(self.bits[1]).context("failed to parse bits2")?,
-            question_count: u16::from_be_bytes(self.question_count),
-            answer_count: u16::from_be_bytes(self.answer_count),
-            authority_count: u16::from_be_bytes(self.authority_count),
-            additional_count: u16::from_be_bytes(self.additional_count),
-        };
-        Ok(res)
+    pub fn write_into(&self, writer: &mut impl Write) -> Result<usize, std::io::Error> {
+        writer.write_all(&self.id.to_be_bytes())?;
+        writer.write_all(&[self.bits1.into(), self.bits2.into()])?;
+        writer.write_all(&self.question_count.to_be_bytes())?;
+        writer.write_all(&self.answer_count.to_be_bytes())?;
+        writer.write_all(&self.authority_count.to_be_bytes())?;
+        writer.write_all(&self.additional_count.to_be_bytes())?;
+        Ok(12)
     }
 }
 #[derive(Debug, Copy, Clone)]
@@ -188,4 +166,35 @@ impl Display for ConversionError {
         f.write_str("Conversion error")
     }
 }
-impl Error for ConversionError {}
+impl std::error::Error for ConversionError {}
+
+pub fn be_u8_into<T: TryFrom<u8>>(bytes: &[u8]) -> nom::IResult<&[u8], T> {
+    let (tail, bits1) = be_u8(bytes)?;
+    let Ok(bits1) = bits1.try_into() else {
+        return Err(Error(make_error(bytes, ErrorKind::Verify)));
+    };
+    Ok((tail, bits1))
+}
+
+pub fn be_u16_into<T: TryFrom<u16>>(bytes: &[u8]) -> nom::IResult<&[u8], T> {
+    let (tail, bits1) = be_u16(bytes)?;
+    let Ok(bits1) = bits1.try_into() else {
+        return Err(Error(make_error(bytes, ErrorKind::Verify)));
+    };
+    Ok((tail, bits1))
+}
+
+pub fn parse_header(bytes: &[u8]) -> nom::IResult<&[u8], DnsHeader> {
+    let (bytes, (id, bits1, bits2, question_count, answer_count, authority_count, additional_count))
+        = (be_u16, be_u8_into, be_u8_into, be_u16, be_u16, be_u16, be_u16).parse(bytes)?;
+    let header = DnsHeader{
+        id,
+        bits1,
+        bits2,
+        question_count,
+        answer_count,
+        authority_count,
+        additional_count,
+    };
+    Ok((bytes, header))
+}
