@@ -1,8 +1,9 @@
 use std::fmt::{Display, Formatter};
 use std::io::Write;
-use nom::Err::Error;
+use nom::Err;
 use nom::error::{ErrorKind, make_error};
 use nom::number::complete::{be_u16, be_u8};
+use nom::{IResult, Parser};
 use nom::sequence::Tuple;
 
 #[derive(Debug)]
@@ -21,14 +22,14 @@ pub(crate) struct DnsHeader {
     pub additional_count: u16,
 }
 impl DnsHeader {
-    pub fn write_into(&self, writer: &mut impl Write) -> Result<usize, std::io::Error> {
+    pub fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
         writer.write_all(&self.id.to_be_bytes())?;
         writer.write_all(&[self.bits1.into(), self.bits2.into()])?;
         writer.write_all(&self.question_count.to_be_bytes())?;
         writer.write_all(&self.answer_count.to_be_bytes())?;
         writer.write_all(&self.authority_count.to_be_bytes())?;
         writer.write_all(&self.additional_count.to_be_bytes())?;
-        Ok(12)
+        Ok(())
     }
 }
 #[derive(Debug, Copy, Clone)]
@@ -168,25 +169,24 @@ impl Display for ConversionError {
 }
 impl std::error::Error for ConversionError {}
 
-pub fn be_u8_into<T: TryFrom<u8>>(bytes: &[u8]) -> nom::IResult<&[u8], T> {
-    let (tail, bits1) = be_u8(bytes)?;
-    let Ok(bits1) = bits1.try_into() else {
-        return Err(Error(make_error(bytes, ErrorKind::Verify)));
-    };
-    Ok((tail, bits1))
+fn parser_try_into<I, F, O1, O2>(mut parser: F) -> impl FnMut(I) -> IResult<I, O2>
+where
+    I: Copy,
+    F: Parser<I, O1, nom::error::Error<I>>,
+    O1: TryInto<O2>,
+{
+    move |input: I| {
+        let (tail, result) = parser.parse(input)?;
+        let Ok(res)= result.try_into() else {
+            return Err(Err::Error(make_error(input, ErrorKind::Verify)));
+        };
+        Ok((tail, res))
+    }
 }
 
-pub fn be_u16_into<T: TryFrom<u16>>(bytes: &[u8]) -> nom::IResult<&[u8], T> {
-    let (tail, bits1) = be_u16(bytes)?;
-    let Ok(bits1) = bits1.try_into() else {
-        return Err(Error(make_error(bytes, ErrorKind::Verify)));
-    };
-    Ok((tail, bits1))
-}
-
-pub fn parse_header(bytes: &[u8]) -> nom::IResult<&[u8], DnsHeader> {
+pub fn parse_header(bytes: &[u8]) -> IResult<&[u8], DnsHeader> {
     let (bytes, (id, bits1, bits2, question_count, answer_count, authority_count, additional_count))
-        = (be_u16, be_u8_into, be_u8_into, be_u16, be_u16, be_u16, be_u16).parse(bytes)?;
+        = (be_u16, parser_try_into(be_u8), parser_try_into(be_u8), be_u16, be_u16, be_u16, be_u16).parse(bytes)?;
     let header = DnsHeader{
         id,
         bits1,

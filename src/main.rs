@@ -44,9 +44,9 @@ fn main() {
             additional_count: 0,
         };
         buf.seek(SeekFrom::Start(0)).unwrap();
-        let written_bytes = response_header.write_into(&mut buf).unwrap();
+        response_header.write_into(&mut buf).unwrap();
         buf.flush().unwrap();
-        let write_data = &buf.get_ref()[..written_bytes];
+        let write_data = &buf.get_ref()[..buf.position() as usize];
 
         let send_result = udp_socket.send_to(write_data, source);
         match send_result {
