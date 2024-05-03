@@ -1,5 +1,5 @@
-use std::io::{Cursor, Seek, SeekFrom, Write};
-use std::net::UdpSocket;
+use std::io::Cursor;
+use std::net::{Ipv4Addr, UdpSocket};
 use crate::message::*;
 
 mod message;
@@ -25,6 +25,7 @@ fn main() {
             Err(error) => eprintln!("failed to parse message {error:?}"),
         }
 
+        let response_ip_int: u32 = Ipv4Addr::new(8, 8, 8, 8).into();
         let response = DnsMessage::make(
             DnsHeaderMain {
                 id: 1234,
@@ -47,11 +48,17 @@ fn main() {
                     class: DnsQuestionClass::IN,
                 }
             ],
+            vec![
+                DnsAnswer {
+                    domain: "codecrafters.io".to_string(),
+                    question_type: DnsQuestionType::A,
+                    class: DnsQuestionClass::IN,
+                    time_to_live: 60,
+                    record_data: response_ip_int.to_be_bytes().to_vec(),
+                }
+            ],
         );
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        response.write_into(&mut buf).unwrap();
-        buf.flush().unwrap();
-        let write_data = &buf.get_ref()[..buf.position() as usize];
+        let write_data = response.write_into_cursor_buf(&mut buf);
 
         let send_result = udp_socket.send_to(write_data, source);
         match send_result {

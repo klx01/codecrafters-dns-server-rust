@@ -1,45 +1,58 @@
 use std::fmt::{Display, Formatter};
-use std::io::Write;
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use nom::Err;
-use nom::error::{ErrorKind, make_error};
-use nom::number::complete::{be_u16, be_u8};
+use nom::error::{ErrorKind, make_error, VerboseError};
+use nom::number::complete::{be_u16, be_u32, be_u8};
 use nom::{IResult, Parser};
 use nom::bytes::complete::tag;
-use nom::multi::{count, length_value, many_till};
+use nom::multi::{count, length_data, length_value, many_till};
 use nom::sequence::Tuple;
 
-#[derive(Debug)]
+type MessageParseError<I> = VerboseError<I>;
+
+#[derive(Debug, PartialEq)]
 pub(crate) struct DnsMessage {
     pub header: DnsHeader,
     pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsAnswer>,
     phantom: PhantomData<()>
 }
 impl DnsMessage {
-    pub fn make(header_main: DnsHeaderMain, questions: Vec<DnsQuestion>) -> Self {
+    pub fn make(header_main: DnsHeaderMain, questions: Vec<DnsQuestion>, answers: Vec<DnsAnswer>) -> Self {
         let header = DnsHeader {
             id: header_main.id,
             bits1: header_main.bits1,
             bits2: header_main.bits2,
             question_count: questions.len().try_into().unwrap(),
-            answer_count: 0,
+            answer_count: answers.len().try_into().unwrap(),
             authority_count: 0,
             additional_count: 0,
             phantom: Default::default(),
         };
-        Self {header, questions, phantom: Default::default()}
+        Self {header, questions, answers, phantom: Default::default()}
     }
     pub fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
         self.header.write_into(writer)?;
         for question in &self.questions {
             question.write_into(writer)?;
         }
+        for answer in &self.answers {
+            answer.write_into(writer)?;
+        }
         Ok(())
     }
-    pub fn parse(bytes: &[u8]) -> IResult<&[u8], Self> {
+    pub fn write_into_cursor_buf<'a, const N: usize>(&self, buf: &'a mut Cursor<[u8; N]>) -> &'a [u8] {
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        self.write_into(buf).unwrap();
+        buf.flush().unwrap();
+        &buf.get_ref()[..buf.position() as usize]
+    }
+    pub fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
         let (bytes, header) = DnsHeader::parse(bytes)?;
-        let (bytes, questions) = count(DnsQuestion::parse, header.question_count as usize)(bytes)?;
-        let message = Self{header, questions, phantom: Default::default()};
+        let (bytes, (questions, answers)) = 
+            (count(DnsQuestion::parse, header.question_count as usize), count(DnsAnswer::parse, header.answer_count as usize)).parse(bytes)?;
+        let message = Self{header, questions, answers, phantom: Default::default()};
         Ok((bytes, message))
     }
 }
@@ -52,7 +65,7 @@ pub(crate) struct DnsHeaderMain {
     pub bits2: DnsHeaderBits2,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct DnsHeader {
     /// A random ID assigned to query packets. Response packets must reply with the same ID.
     pub id: u16,
@@ -78,7 +91,7 @@ impl DnsHeader {
         writer.write_all(&self.additional_count.to_be_bytes())?;
         Ok(())
     }
-    fn parse(bytes: &[u8]) -> IResult<&[u8], Self> {
+    fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
         let (bytes, (id, bits1, bits2, question_count, answer_count, authority_count, additional_count))
             = (be_u16, parser_try_into(be_u8), parser_try_into(be_u8), be_u16, be_u16, be_u16, be_u16).parse(bytes)?;
         let header = Self{
@@ -94,7 +107,7 @@ impl DnsHeader {
         Ok((bytes, header))
     }
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct DnsHeaderBits1 {
     /// 1 bit   Query/Response Indicator (QR)   1 for a reply packet, 0 for a question packet.
     pub is_response: bool,
@@ -138,7 +151,7 @@ impl Into<u8> for DnsHeaderBits1 {
         res
     }
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum DnsHeaderOpcode {
     Query = 0,
     InverseQuery = 1,
@@ -155,7 +168,7 @@ impl TryFrom<u8> for DnsHeaderOpcode {
         }
     }
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct DnsHeaderBits2 {
     /// 1 bit   Recursion Available (RA)        Server sets this to 1 to indicate that recursion is available.
     pub is_recursion_available: bool,
@@ -182,7 +195,7 @@ impl Into<u8> for DnsHeaderBits2 {
         res
     }
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum DnsHeaderResponseCode {
     NoError = 0,
     FormatError = 1,
@@ -231,7 +244,7 @@ impl Display for ConversionError {
 }
 impl std::error::Error for ConversionError {}
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct DnsQuestion {
     pub domain: String,
     pub question_type: DnsQuestionType,
@@ -239,15 +252,12 @@ pub(crate) struct DnsQuestion {
 }
 impl DnsQuestion {
     fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
-        for domain_part in self.domain.split('.') {
-            writer.write_all(&(domain_part.len() as u8).to_be_bytes())?;
-            writer.write_all(domain_part.as_bytes())?;
-        }
+        write_domain(&self.domain, writer)?;
         writer.write_all(&(self.question_type as u16).to_be_bytes())?;
         writer.write_all(&(self.class as u16).to_be_bytes())?;
         Ok(())
     }
-    fn parse(bytes: &[u8]) -> IResult<&[u8], Self> {
+    fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
         let (bytes, (domain, question_type, class)) =
             (parse_domain, parser_try_into(be_u16), parser_try_into(be_u16)).parse(bytes)?;
         let question = Self{domain, question_type, class};
@@ -255,7 +265,7 @@ impl DnsQuestion {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum DnsQuestionType {
     /// a host address
     A = 1,
@@ -297,7 +307,7 @@ impl TryFrom<u16> for DnsQuestionType {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum DnsQuestionClass {
     /// the Internet
     IN = 1,
@@ -318,10 +328,41 @@ impl TryFrom<u16> for DnsQuestionClass {
     }
 }
 
-fn parser_try_into<I, F, O1, O2>(mut parser: F) -> impl FnMut(I) -> IResult<I, O2>
+#[derive(Debug, PartialEq)]
+pub(crate) struct DnsAnswer {
+    pub domain: String,
+    pub question_type: DnsQuestionType,
+    pub class: DnsQuestionClass,
+    /// The duration in seconds a record can be cached before requerying
+    pub time_to_live: u32,
+    /// Data specific to the record type
+    pub record_data: Vec<u8>,
+}
+impl DnsAnswer {
+    fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+        write_domain(&self.domain, writer)?;
+        writer.write_all(&(self.question_type as u16).to_be_bytes())?;
+        writer.write_all(&(self.class as u16).to_be_bytes())?;
+        writer.write_all(&self.time_to_live.to_be_bytes())?;
+        writer.write_all(&(self.record_data.len() as u16).to_be_bytes())?;
+        if self.record_data.len() > 0 {
+            writer.write_all(&self.record_data)?;
+        }
+        Ok(())
+    }
+    fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
+        let (bytes, (domain, question_type, class, time_to_live, record_data)) =
+            (parse_domain, parser_try_into(be_u16), parser_try_into(be_u16), be_u32, length_data(be_u16)).parse(bytes)?;
+        let record_data = record_data.to_vec();
+        let question = Self{domain, question_type, class, time_to_live, record_data};
+        Ok((bytes, question))
+    }
+}
+
+fn parser_try_into<I, F, O1, O2>(mut parser: F) -> impl FnMut(I) -> IResult<I, O2, MessageParseError<I>>
 where
     I: Copy,
-    F: Parser<I, O1, nom::error::Error<I>>,
+    F: Parser<I, O1, MessageParseError<I>>,
     O1: TryInto<O2>,
 {
     move |input: I| {
@@ -333,14 +374,14 @@ where
     }
 }
 
-fn parse_string(bytes: &[u8]) -> IResult<&[u8], &str> {
+fn parse_string(bytes: &[u8]) -> IResult<&[u8], &str, MessageParseError<&[u8]>> {
     match std::str::from_utf8(bytes) {
         Ok(x) => Ok((&[], x)),
         Err(_) => Err(Err::Error(make_error(bytes, ErrorKind::Verify))),
     }
 }
 
-fn parse_domain(input: &[u8]) -> IResult<&[u8], String> {
+fn parse_domain(input: &[u8]) -> IResult<&[u8], String, MessageParseError<&[u8]>> {
     // i could also add a size limit to make sure that the string is not too lar, but we are already limited by the initial buffer size, so it's ok
     let (tail, (domain_parts, _null)) = many_till(length_value(be_u8, parse_string), tag(b"\0")).parse(input)?;
     if domain_parts.len() == 0 {
@@ -348,4 +389,66 @@ fn parse_domain(input: &[u8]) -> IResult<&[u8], String> {
     }
     let domain = domain_parts.join(".");
     Ok((tail, domain))
+}
+
+fn write_domain(domain: &str, writer: &mut impl Write) -> Result<(), std::io::Error> {
+    for domain_part in domain.split('.') {
+        writer.write_all(&(domain_part.len() as u8).to_be_bytes())?;
+        writer.write_all(domain_part.as_bytes())?;
+    }
+    writer.write_all(&[0])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Cursor;
+    use std::net::Ipv4Addr;
+    use super::*;
+    #[test]
+    fn test_write_and_parse() {
+        let mut buf = Cursor::new([0u8; 2048]);
+        
+        let response_ip_int: u32 = Ipv4Addr::new(8, 8, 8, 8).into();
+        let orig = DnsMessage::make(
+            DnsHeaderMain {
+                id: 1234,
+                bits1: DnsHeaderBits1 {
+                    is_response: true,
+                    opcode: DnsHeaderOpcode::Query,
+                    is_authoritative: false,
+                    is_truncated: false,
+                    is_recursion_desired: false,
+                },
+                bits2: DnsHeaderBits2 {
+                    is_recursion_available: false,
+                    response_code: DnsHeaderResponseCode::NoError,
+                },
+            },
+            vec![
+                DnsQuestion {
+                    domain: "codecrafters.io".to_string(),
+                    question_type: DnsQuestionType::A,
+                    class: DnsQuestionClass::IN,
+                }
+            ],
+            vec![
+                DnsAnswer {
+                    domain: "codecrafters.io".to_string(),
+                    question_type: DnsQuestionType::A,
+                    class: DnsQuestionClass::IN,
+                    time_to_live: 60,
+                    record_data: response_ip_int.to_be_bytes().to_vec(),
+                }
+            ],
+        );
+        let write_data = orig.write_into_cursor_buf(&mut buf);
+        
+        let (tail, parsed) = match DnsMessage::parse(write_data) {
+            Ok(x) => x,
+            Err(err) => panic!("{err}"),
+        };
+        assert_eq!(orig, parsed);
+        assert_eq!(0, tail.len());
+    }
 }
