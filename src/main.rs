@@ -20,31 +20,36 @@ fn main() {
         };
 
         let read_data = &buf.get_ref()[..read_size];
-        match parse_header(read_data) {
-            Ok((tail, header)) => println!("got request header {header:?}, tail: {tail:?}"),
-            Err(error) => eprintln!("failed to parse header {error}"),
+        match DnsMessage::parse(read_data) {
+            Ok((tail, message)) => println!("got request {message:?}, tail: {tail:?}"),
+            Err(error) => eprintln!("failed to parse message {error:?}"),
         }
 
-        let response_header = DnsHeader {
-            id: 1234,
-            bits1: DnsHeaderBits1 {
-                is_response: true,
-                opcode: DnsHeaderOpcode::Query,
-                is_authoritative: false,
-                is_truncated: false,
-                is_recursion_desired: false,
+        let response = DnsMessage::make(
+            DnsHeaderMain {
+                id: 1234,
+                bits1: DnsHeaderBits1 {
+                    is_response: true,
+                    opcode: DnsHeaderOpcode::Query,
+                    is_authoritative: false,
+                    is_truncated: false,
+                    is_recursion_desired: false,
+                },
+                bits2: DnsHeaderBits2 {
+                    is_recursion_available: false,
+                    response_code: DnsHeaderResponseCode::NoError,
+                },
             },
-            bits2: DnsHeaderBits2 {
-                is_recursion_available: false,
-                response_code: DnsHeaderResponseCode::NoError,
-            },
-            question_count: 0,
-            answer_count: 0,
-            authority_count: 0,
-            additional_count: 0,
-        };
+            vec![
+                DnsQuestion {
+                    domain: "codecrafters.io".to_string(),
+                    question_type: DnsQuestionType::A,
+                    class: DnsQuestionClass::IN,
+                }
+            ],
+        );
         buf.seek(SeekFrom::Start(0)).unwrap();
-        response_header.write_into(&mut buf).unwrap();
+        response.write_into(&mut buf).unwrap();
         buf.flush().unwrap();
         let write_data = &buf.get_ref()[..buf.position() as usize];
 
