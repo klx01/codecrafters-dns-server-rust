@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -5,11 +6,14 @@ use nom::Err;
 use nom::error::{ErrorKind, make_error, VerboseError};
 use nom::number::complete::{be_u16, be_u32, be_u8};
 use nom::{IResult, Parser};
+use nom::branch::alt;
 use nom::bytes::complete::tag;
+use nom::combinator::into;
 use nom::multi::{count, length_data, length_value, many_till};
 use nom::sequence::Tuple;
 
 type MessageParseError<I> = VerboseError<I>;
+const OFFSET_TAG: u16 = 0b1100000000000000;
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct DnsMessage {
@@ -32,13 +36,14 @@ impl DnsMessage {
         };
         Self {header, questions, answers, phantom: Default::default()}
     }
-    pub fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+    pub fn write_into<W: Write + Seek>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        let mut compression_offsets = HashMap::new();
         self.header.write_into(writer)?;
         for question in &self.questions {
-            question.write_into(writer)?;
+            question.write_into(writer, &mut compression_offsets)?;
         }
         for answer in &self.answers {
-            answer.write_into(writer)?;
+            answer.write_into(writer, &mut compression_offsets)?;
         }
         Ok(())
     }
@@ -48,10 +53,10 @@ impl DnsMessage {
         buf.flush().unwrap();
         &buf.get_ref()[..buf.position() as usize]
     }
-    pub fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
-        let (bytes, header) = DnsHeader::parse(bytes)?;
-        let (bytes, (questions, answers)) = 
-            (count(DnsQuestion::parse, header.question_count as usize), count(DnsAnswer::parse, header.answer_count as usize)).parse(bytes)?;
+    pub fn parse(message: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
+        let (bytes, header) = DnsHeader::parse(message)?;
+        let (bytes, (questions, answers)) =
+            (count(DnsQuestion::parse(message), header.question_count as usize), count(DnsAnswer::parse(message), header.answer_count as usize)).parse(bytes)?;
         let message = Self{header, questions, answers, phantom: Default::default()};
         Ok((bytes, message))
     }
@@ -251,17 +256,19 @@ pub(crate) struct DnsQuestion {
     pub class: DnsQuestionClass,
 }
 impl DnsQuestion {
-    fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
-        write_domain(&self.domain, writer)?;
+    fn write_into<'a, W: Write + Seek>(&'a self, writer: &mut W, compression_offsets: &mut HashMap<&'a str, u16>) -> Result<(), std::io::Error> {
+        write_domain(&self.domain, writer, compression_offsets)?;
         writer.write_all(&(self.question_type as u16).to_be_bytes())?;
         writer.write_all(&(self.class as u16).to_be_bytes())?;
         Ok(())
     }
-    fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
-        let (bytes, (domain, question_type, class)) =
-            (parse_domain, parser_try_into(be_u16), parser_try_into(be_u16)).parse(bytes)?;
-        let question = Self{domain, question_type, class};
-        Ok((bytes, question))
+    fn parse<'a>(message: &'a [u8]) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Self, MessageParseError<&'a [u8]>> {
+        |bytes| {
+            let (bytes, (domain, question_type, class)) =
+                (parse_domain(message, 0), parser_try_into(be_u16), parser_try_into(be_u16)).parse(bytes)?;
+            let question = Self{domain, question_type, class};
+            Ok((bytes, question))
+        }
     }
 }
 
@@ -339,8 +346,8 @@ pub(crate) struct DnsAnswer {
     pub record_data: Vec<u8>,
 }
 impl DnsAnswer {
-    fn write_into(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
-        write_domain(&self.domain, writer)?;
+    fn write_into<'a, W: Write + Seek>(&'a self, writer: &mut W, compression_offsets: &mut HashMap<&'a str, u16>) -> Result<(), std::io::Error> {
+        write_domain(&self.domain, writer, compression_offsets)?;
         writer.write_all(&(self.question_type as u16).to_be_bytes())?;
         writer.write_all(&(self.class as u16).to_be_bytes())?;
         writer.write_all(&self.time_to_live.to_be_bytes())?;
@@ -350,12 +357,14 @@ impl DnsAnswer {
         }
         Ok(())
     }
-    fn parse(bytes: &[u8]) -> IResult<&[u8], Self, MessageParseError<&[u8]>> {
-        let (bytes, (domain, question_type, class, time_to_live, record_data)) =
-            (parse_domain, parser_try_into(be_u16), parser_try_into(be_u16), be_u32, length_data(be_u16)).parse(bytes)?;
-        let record_data = record_data.to_vec();
-        let question = Self{domain, question_type, class, time_to_live, record_data};
-        Ok((bytes, question))
+    fn parse<'a>(message: &'a [u8]) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Self, MessageParseError<&'a [u8]>> {
+        |bytes| {
+            let (bytes, (domain, question_type, class, time_to_live, record_data)) =
+                (parse_domain(message, 0), parser_try_into(be_u16), parser_try_into(be_u16), be_u32, length_data(be_u16)).parse(bytes)?;
+            let record_data = record_data.to_vec();
+            let question = Self{domain, question_type, class, time_to_live, record_data};
+            Ok((bytes, question))
+        }
     }
 }
 
@@ -374,6 +383,13 @@ where
     }
 }
 
+fn parser_none<I, O, E, F: Parser<I, O, E>, S>(mut parser: F) -> impl FnMut(I) -> IResult<I, Option<S>, E> {
+    move |input: I| {
+        let (tail, _result) = parser.parse(input)?;
+        Ok((tail, None))
+    }
+}
+
 fn parse_string(bytes: &[u8]) -> IResult<&[u8], &str, MessageParseError<&[u8]>> {
     match std::str::from_utf8(bytes) {
         Ok(x) => Ok((&[], x)),
@@ -381,22 +397,73 @@ fn parse_string(bytes: &[u8]) -> IResult<&[u8], &str, MessageParseError<&[u8]>> 
     }
 }
 
-fn parse_domain(input: &[u8]) -> IResult<&[u8], String, MessageParseError<&[u8]>> {
-    // i could also add a size limit to make sure that the string is not too lar, but we are already limited by the initial buffer size, so it's ok
-    let (tail, (domain_parts, _null)) = many_till(length_value(be_u8, parse_string), tag(b"\0")).parse(input)?;
-    if domain_parts.len() == 0 {
-        return Err(Err::Error(make_error(input, ErrorKind::Verify)));
+fn parse_domain<'a>(message: &'a [u8], recursion_level: u8) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], String, MessageParseError<&'a [u8]>> {
+    move |input| {
+        // i could also add a size limit to make sure that the string is not too lar, but we are already limited by the initial buffer size, so it's ok
+        let (tail, (mut domain_parts, offset)) = many_till(
+            length_value(be_u8, parse_string),
+            alt((parser_none(tag(b"\0")), into(parse_offset)))
+        ).parse(input)?;
+
+        let decompressed = if let Some(offset) = offset {
+            if recursion_level > 5 {
+                return Err(Err::Error(make_error(input, ErrorKind::Verify)));
+            }
+            let offset = offset as usize;
+            let (_, decompressed) = parse_domain(message, recursion_level + 1)(&message[offset..])?;
+            Some(decompressed)
+        } else {
+            None
+        };
+        if let Some(decompressed) = &decompressed {
+            domain_parts.push(decompressed);
+        }
+        if domain_parts.len() == 0 {
+            return Err(Err::Error(make_error(input, ErrorKind::Verify)));
+        }
+        let domain = domain_parts.join(".");
+        Ok((tail, domain))
     }
-    let domain = domain_parts.join(".");
-    Ok((tail, domain))
 }
 
-fn write_domain(domain: &str, writer: &mut impl Write) -> Result<(), std::io::Error> {
-    for domain_part in domain.split('.') {
-        writer.write_all(&(domain_part.len() as u8).to_be_bytes())?;
-        writer.write_all(domain_part.as_bytes())?;
+fn parse_offset(input: &[u8]) -> IResult<&[u8], u16, MessageParseError<&[u8]>> {
+    let (tail, offset) = be_u16(input)?;
+    if (offset & OFFSET_TAG) != OFFSET_TAG {
+        return Err(Err::Error(make_error(input, ErrorKind::Verify)));
     }
-    writer.write_all(&[0])?;
+    let offset = offset & !OFFSET_TAG;
+    Ok((tail, offset))
+}
+
+fn write_domain<'a, W: Write + Seek>(domain: &'a str, writer: &mut W, compression_offsets: &mut HashMap<&'a str, u16>) -> Result<(), std::io::Error> {
+    let mut domain_tail = domain;
+    loop {
+        match compression_offsets.get(domain_tail) {
+            Some(offset) => {
+                let offset = offset | OFFSET_TAG; 
+                writer.write_all(&offset.to_be_bytes())?;
+                break;
+            }
+            None => {
+                let current_offset = writer.stream_position().unwrap() as u16;
+                compression_offsets.insert(domain_tail, current_offset);
+                
+                let (domain_part, next_tail) = match domain_tail.split_once('.') {
+                    Some(x) => (x.0, Some(x.1)),
+                    None => (domain_tail, None),
+                };
+                writer.write_all(&(domain_part.len() as u8).to_be_bytes())?;
+                writer.write_all(domain_part.as_bytes())?;
+                match next_tail {
+                    Some(tail) => domain_tail = tail,
+                    None => {
+                        writer.write_all(&[0])?;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -408,7 +475,7 @@ mod test {
     #[test]
     fn test_write_and_parse() {
         let mut buf = Cursor::new([0u8; 2048]);
-        
+
         let response_ip_int: u32 = Ipv4Addr::new(8, 8, 8, 8).into();
         let orig = DnsMessage::make(
             DnsHeaderMain {
@@ -443,10 +510,10 @@ mod test {
             ],
         );
         let write_data = orig.write_into_cursor_buf(&mut buf);
-        
+
         let (tail, parsed) = match DnsMessage::parse(write_data) {
             Ok(x) => x,
-            Err(err) => panic!("{err}"),
+            Err(err) => panic!("{err:?}"),
         };
         assert_eq!(orig, parsed);
         assert_eq!(0, tail.len());

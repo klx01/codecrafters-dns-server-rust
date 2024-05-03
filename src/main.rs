@@ -25,14 +25,14 @@ fn main() {
                 //println!("got request {message:?}, tail: {_tail:?}");
                 message
             },
-            Err(error) => { 
+            Err(error) => {
                 eprintln!("failed to parse message {error:?}");
                 continue;
             },
         };
 
-        let response_code = if request.header.bits1.opcode == DnsHeaderOpcode::Query { 
-            DnsHeaderResponseCode::NoError 
+        let response_code = if request.header.bits1.opcode == DnsHeaderOpcode::Query {
+            DnsHeaderResponseCode::NoError
         } else {
             DnsHeaderResponseCode::NotImplemented
         };
