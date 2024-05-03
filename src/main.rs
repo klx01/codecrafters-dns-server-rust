@@ -10,7 +10,7 @@ fn main() {
 
     let mut buf = Cursor::new([0u8; 2048]);
 
-    loop {
+    'outer: loop {
         let (read_size, source) = match udp_socket.recv_from(buf.get_mut()) {
             Ok(x) => x,
             Err(err) => {
@@ -20,43 +20,60 @@ fn main() {
         };
 
         let read_data = &buf.get_ref()[..read_size];
-        match DnsMessage::parse(read_data) {
-            Ok((tail, message)) => println!("got request {message:?}, tail: {tail:?}"),
-            Err(error) => eprintln!("failed to parse message {error:?}"),
-        }
-
-        let response_ip_int: u32 = Ipv4Addr::new(8, 8, 8, 8).into();
-        let response = DnsMessage::make(
-            DnsHeaderMain {
-                id: 1234,
-                bits1: DnsHeaderBits1 {
-                    is_response: true,
-                    opcode: DnsHeaderOpcode::Query,
-                    is_authoritative: false,
-                    is_truncated: false,
-                    is_recursion_desired: false,
-                },
-                bits2: DnsHeaderBits2 {
-                    is_recursion_available: false,
-                    response_code: DnsHeaderResponseCode::NoError,
-                },
+        let request = match DnsMessage::parse(read_data) {
+            Ok((_tail, message)) => { 
+                //println!("got request {message:?}, tail: {_tail:?}");
+                message
             },
-            vec![
-                DnsQuestion {
-                    domain: "codecrafters.io".to_string(),
-                    question_type: DnsQuestionType::A,
-                    class: DnsQuestionClass::IN,
-                }
-            ],
-            vec![
+            Err(error) => { 
+                eprintln!("failed to parse message {error:?}");
+                continue;
+            },
+        };
+
+        let response_code = if request.header.bits1.opcode == DnsHeaderOpcode::Query { 
+            DnsHeaderResponseCode::NoError 
+        } else {
+            DnsHeaderResponseCode::NotImplemented
+        };
+        let response_ip_int: u32 = Ipv4Addr::new(8, 8, 8, 8).into();
+        let mut answers = vec![];
+        for question in &request.questions {
+            if question.question_type != DnsQuestionType::A {
+                eprintln!("Got a question type {:?}, can not respond", question.question_type);
+                continue 'outer;
+            }
+            if question.class != DnsQuestionClass::IN {
+                eprintln!("Got a question class {:?}, can not respond", question.class);
+                continue 'outer;
+            }
+            answers.push(
                 DnsAnswer {
-                    domain: "codecrafters.io".to_string(),
-                    question_type: DnsQuestionType::A,
-                    class: DnsQuestionClass::IN,
+                    domain: question.domain.clone(),
+                    question_type: question.question_type,
+                    class: question.class,
                     time_to_live: 60,
                     record_data: response_ip_int.to_be_bytes().to_vec(),
                 }
-            ],
+            );
+        }
+        let response = DnsMessage::make(
+            DnsHeaderMain {
+                id: request.header.id,
+                bits1: DnsHeaderBits1 {
+                    is_response: true,
+                    opcode: request.header.bits1.opcode,
+                    is_authoritative: false,
+                    is_truncated: false,
+                    is_recursion_desired: request.header.bits1.is_recursion_desired,
+                },
+                bits2: DnsHeaderBits2 {
+                    is_recursion_available: false,
+                    response_code,
+                },
+            },
+            request.questions,
+            answers,
         );
         let write_data = response.write_into_cursor_buf(&mut buf);
 
